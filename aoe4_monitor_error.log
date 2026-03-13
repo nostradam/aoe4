@@ -1,0 +1,4 @@
+MISSING PACKAGE: psutil
+Run: pip install psutil
+
+Detail: No module named 'psutil'
