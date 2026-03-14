@@ -66,7 +66,7 @@ CONSECUTIVE_NEEDED   = 3      # consecutive detections before alerting
 
 ORANGE_THRESHOLD_PCT = 0.4
 RED_THRESHOLD_PCT    = 0.3
-BLUE_PIXEL_COUNT_MIN = 20     # min blue pixels to count as "idle villagers present"
+BLUE_PIXEL_COUNT_MIN = 10     # min blue pixels to count as "idle villagers present"
 
 CALIBRATION_FILE     = "aoe4_calibration.json"
 
@@ -100,12 +100,8 @@ def get_physical_screen_size():
     return user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
 
 def default_regions(sw, sh):
-    # Housing icon: x=0.3%-4.8%, y=78.2%-86.7%
-    # Tight around the red/orange house icon only.
-    housing  = (int(0.003*sw), int(0.782*sh), int(0.048*sw), int(0.867*sh))
-    # Idle villager teal box: x=4.9%-10.4%, y=72.6%-90.3%
-    # Full height of the teal box including icon and digit.
-    villager = (int(0.049*sw), int(0.726*sh), int(0.104*sw), int(0.960*sh))
+    housing  = (0,             int(0.785*sh), int(0.120*sw), int(0.840*sh))
+    villager = (int(0.050*sw), int(0.765*sh), int(0.115*sw), int(0.830*sh))
     return housing, villager
 
 def load_calibration(sw, sh):
@@ -129,8 +125,8 @@ def save_calibration(sw, sh, housing, villager, px_per_villager):
     if os.path.exists(CALIBRATION_FILE):
         with open(CALIBRATION_FILE) as f:
             data = json.load(f)
-    data[key] = {"housing": [int(x) for x in housing], "villager": [int(x) for x in villager],
-                 "px_per_villager": float(px_per_villager) if px_per_villager is not None else None}
+    data[key] = {"housing": list(housing), "villager": list(villager),
+                 "px_per_villager": px_per_villager}
     with open(CALIBRATION_FILE, "w") as f:
         json.dump(data, f, indent=2)
     print(f"  Saved → {CALIBRATION_FILE}")
@@ -250,6 +246,10 @@ def monitor_loop(h_region, v_region, px_per_villager):
             err = traceback.format_exc()
             print(f"[monitor error]\n{err}")
             write_log(err)
+            # Reset consecutive counters so a grab() failure during age-up or
+            # loading screens doesn't keep stale counts that retrigger alerts
+            h_consec = 0
+            v_consec = 0
 
         time.sleep(CHECK_INTERVAL)
 
@@ -280,15 +280,9 @@ def calibrate():
     print("\n  Capturing in 3 seconds...")
     for i in range(3,0,-1): print(f"    {i}..."); time.sleep(1)
 
-    # Use mss for full-screen capture so coordinates match the main monitoring loop
-    # (both use physical pixels, avoiding DPI scaling mismatches with ImageGrab)
-    import mss as _mss_cal
-    with _mss_cal.mss() as _sct:
-        _raw = _sct.grab(_sct.monitors[0])
-        full = np.frombuffer(_raw.bgra, dtype=np.uint8).reshape(_raw.height, _raw.width, 4)
-        full = full[:, :, 2::-1]  # BGRA -> RGB
-    from PIL import Image as _PILImage
-    screenshot = _PILImage.fromarray(full)
+    from PIL import ImageGrab as _IG
+    screenshot = _IG.grab()
+    full       = np.array(screenshot)
     print(f"  Captured.\n")
 
     x_max   = int(sw * 0.20)
@@ -309,26 +303,13 @@ def calibrate():
         print("  WARNING: Not found — using defaults.\n")
         best_housing, _ = default_regions(sw, sh)
     else:
-        # Tighten x bounds: scan the found row for actual red/orange pixels
-        y1h, y2h = best_housing[1], best_housing[3]
-        strip = full[y1h:y2h, 0:x_max]
-        rh=strip[:,:,0].astype(int); gh=strip[:,:,1].astype(int); bh=strip[:,:,2].astype(int)
-        color_cols = np.where(
-            (((rh>175)&(gh<85)&(bh<85)&(rh>gh*2.0)) |
-             ((rh>155)&(gh>70)&(gh<150)&(bh<65)&(rh>gh*1.35))).any(axis=0)
-        )[0]
-        if len(color_cols) > 0:
-            pad = max(30, int(sw * 0.005))
-            tx1 = max(0, color_cols[0] - pad)
-            tx2 = min(x_max, color_cols[-1] + pad)
-            best_housing = (tx1, y1h, tx2, y2h)
         print(f"  ✓ Housing: {best_housing}  (score={best_h})\n")
 
     # Villager icon
     print("  Scanning for idle villager indicator (blue)...")
     best_villager = None; best_v = 0
     for y1 in range(y_start, sh-10, 3):
-        for hs in [30, 60, 100, 150]:
+        for hs in [25, 35, 50]:
             y2 = min(y1+hs, sh)
             s  = full[y1:y2, 0:x_max]
             r=s[:,:,0].astype(int); g=s[:,:,1].astype(int); b=s[:,:,2].astype(int)
@@ -340,24 +321,6 @@ def calibrate():
         print("  WARNING: Not found — using defaults.\n")
         _, best_villager = default_regions(sw, sh)
     else:
-        # Tighten x bounds: find actual teal/blue pixel column range
-        y1v, y2v = best_villager[1], best_villager[3]
-        stripv = full[y1v:y2v, 0:x_max]
-        rv=stripv[:,:,0].astype(int); gv=stripv[:,:,1].astype(int); bv=stripv[:,:,2].astype(int)
-        blue_cols = np.where(((bv>140)&(bv>rv+25)&(bv>gv+15)).any(axis=0))[0]
-        if len(blue_cols) > 0:
-            pad = max(30, int(sw * 0.005))
-            tx1v = max(0, blue_cols[0] - pad)
-            tx2v = min(x_max, blue_cols[-1] + pad)
-            # Find exact y2 by scanning downward from y1v for last row with blue pixels
-            blue_rows = np.where(((bv>140)&(bv>rv+25)&(bv>gv+15)).any(axis=1))[0]
-            if len(blue_rows) > 0:
-                ty1v = max(0, y1v + blue_rows[0] - pad)
-                ty2v = min(sh, y1v + blue_rows[-1] + pad)
-            else:
-                ty1v = y1v
-                ty2v = y2v
-            best_villager = (tx1v, ty1v, tx2v, ty2v)
         print(f"  ✓ Villager: {best_villager}  (blue_px={best_v})\n")
 
         # Count calibration
